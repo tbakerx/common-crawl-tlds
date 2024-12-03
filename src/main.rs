@@ -4,23 +4,25 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use dashmap::DashSet;
 use flate2::read::MultiGzDecoder;
-use futures::future;
+use futures::{StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parquet::{
     arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, AsyncArrowWriter},
     basic::Compression,
     file::properties::WriterProperties,
 };
+use rayon::prelude::*;
 use std::{
-    collections::HashSet,
     io::{BufRead, BufReader},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 use tokio::sync::Mutex;
 
-#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct DomainInfo {
     domain: String,
     tld: String,
@@ -29,32 +31,37 @@ struct DomainInfo {
 struct BatchWriter {
     batch_dir: PathBuf,
     max_batch_size: usize,
-    current_domains: HashSet<DomainInfo>, // Changed back to HashSet for immediate deduplication
+    current_domains: DashSet<DomainInfo>,
     current_batch: usize,
     total_domains: usize,
 }
 
 impl BatchWriter {
-    fn new(batch_dir: PathBuf, max_batch_size: usize) -> Self {
-        Self {
+    async fn new(batch_dir: PathBuf, max_batch_size: usize) -> Result<Self> {
+        Ok(Self {
             batch_dir,
             max_batch_size,
-            current_domains: HashSet::with_capacity(max_batch_size),
+            current_domains: DashSet::with_capacity(max_batch_size),
             current_batch: 0,
             total_domains: 0,
-        }
+        })
     }
 
-    async fn add_domain(&mut self, domain: DomainInfo) -> Result<bool> {
-        if self.current_domains.insert(domain) {
-            self.total_domains += 1;
+    async fn add_domains(&mut self, domains: &[DomainInfo]) -> Result<()> {
+        let mut write_batch = false;
+        for domain in domains {
+            if self.current_domains.insert(domain.clone()) {
+                self.total_domains += 1;
+                if self.current_domains.len() >= self.max_batch_size {
+                    write_batch = true;
+                    break;
+                }
+            }
         }
-
-        if self.current_domains.len() >= self.max_batch_size {
+        if write_batch {
             self.write_batch().await?;
-            return Ok(true);
         }
-        Ok(false)
+        Ok(())
     }
 
     async fn write_batch(&mut self) -> Result<()> {
@@ -72,18 +79,15 @@ impl BatchWriter {
             Field::new("tld", DataType::Utf8, false),
         ]);
 
-        // Convert to sorted Vec for consistent output
-        let mut domains: Vec<_> = self.current_domains.iter().collect();
-        domains.sort_unstable_by(|a, b| a.domain.cmp(&b.domain).then(a.tld.cmp(&b.tld)));
-
-        println!(
-            "Writing batch {} with {} domains",
-            self.current_batch - 1,
-            domains.len()
-        );
+        let mut domains: Vec<_> = self
+            .current_domains
+            .iter()
+            .map(|d| (*d.key()).clone())
+            .collect();
+        domains.par_sort_unstable_by(|a, b| a.domain.cmp(&b.domain).then(a.tld.cmp(&b.tld)));
 
         let (domain_vec, tld_vec): (Vec<_>, Vec<_>) = domains
-            .iter()
+            .par_iter()
             .map(|d| (d.domain.as_str(), d.tld.as_str()))
             .unzip();
 
@@ -105,7 +109,11 @@ impl BatchWriter {
         writer.write(&batch).await?;
         writer.close().await?;
 
-        // Clear the domains after successful write
+        println!(
+            "Wrote batch {} with {} domains",
+            self.current_batch - 1,
+            domains.len()
+        );
         self.current_domains.clear();
         Ok(())
     }
@@ -120,18 +128,20 @@ struct ParquetProcessor {
 
 impl ParquetProcessor {
     async fn new(work_dir: PathBuf) -> Result<Self> {
-        // Create directories if they don't exist
         tokio::fs::create_dir_all(&work_dir).await?;
-
         let batch_dir = work_dir.join("batches");
         tokio::fs::create_dir_all(&batch_dir).await?;
 
         Ok(Self {
             client: reqwest::Client::builder()
-                .pool_idle_timeout(Some(std::time::Duration::from_secs(30)))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(0)
+                .timeout(Duration::from_secs(300))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Duration::from_secs(60))
                 .build()
                 .unwrap(),
-            batch_writer: Arc::new(Mutex::new(BatchWriter::new(batch_dir, 1_000_000))),
+            batch_writer: Arc::new(Mutex::new(BatchWriter::new(batch_dir, 1_000_000).await?)),
             progress: MultiProgress::new(),
             work_dir,
         })
@@ -139,35 +149,67 @@ impl ParquetProcessor {
 
     async fn process_parquet_files(&self, paths: Vec<String>) -> Result<()> {
         let total_pb = self.progress.add(ProgressBar::new(paths.len() as u64));
-        total_pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} files ({eta}) - {msg}")
-            .expect("Valid template")
-            .progress_chars("#>-"));
+        total_pb.set_style(
+           ProgressStyle::default_bar()
+               .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} files ({eta}) - {msg}")
+               .expect("Valid template")
+               .progress_chars("#>-"),
+       );
 
-        let chunk_size = 5;
-        for (chunk_idx, chunk) in paths.chunks(chunk_size).enumerate() {
-            let futures: Vec<_> = chunk
-                .iter()
-                .map(|path| {
-                    let pb = self.progress.add(ProgressBar::new_spinner());
-                    self.process_single_file(path.clone(), pb)
+        let chunk_size = 20;
+        for paths_chunk in paths.chunks(chunk_size) {
+            let downloads = futures::future::try_join_all(paths_chunk.iter().map(|path| async {
+                let pb = self.progress.add(ProgressBar::new_spinner());
+                let path = path.clone();
+                let temp_path = self
+                    .work_dir
+                    .join(format!("temp_{}.parquet", path.replace('/', "_")));
+
+                pb.set_message(format!("Downloading {}", path));
+
+                let response = self
+                    .client
+                    .get(&format!("https://data.commoncrawl.org/{}", path))
+                    .send()
+                    .await?;
+
+                let bytes = response.bytes().await?;
+
+                tokio::fs::write(&temp_path, bytes).await?;
+
+                Ok::<(String, PathBuf, ProgressBar), anyhow::Error>((path, temp_path, pb))
+            }))
+            .await?;
+
+            let results: Vec<_> = downloads
+                .into_iter()
+                .map(|(path, temp_path, pb)| {
+                    let batch_writer = self.batch_writer.clone();
+                    async move {
+                        pb.set_message(format!("Processing {}", path));
+                        self.process_downloaded_file(&temp_path, &batch_writer, &pb)
+                            .await?;
+                        tokio::fs::remove_file(&temp_path).await?;
+                        pb.finish_and_clear();
+                        Ok::<(), anyhow::Error>(())
+                    }
                 })
                 .collect();
 
-            future::join_all(futures).await;
-            total_pb.inc(chunk.len() as u64);
+            futures::future::try_join_all(results).await?;
+
+            total_pb.inc(chunk_size as u64);
 
             let writer = self.batch_writer.lock().await;
             total_pb.set_message(format!(
                 "Processed {}/{} chunks - {} domains in {} batches",
-                chunk_idx + 1,
+                total_pb.position() as usize / chunk_size + 1,
                 (paths.len() + chunk_size - 1) / chunk_size,
                 writer.total_domains,
                 writer.current_batch
             ));
         }
 
-        // Ensure final batch is written
         self.batch_writer.lock().await.write_batch().await?;
 
         let writer = self.batch_writer.lock().await;
@@ -180,77 +222,68 @@ impl ParquetProcessor {
         Ok(())
     }
 
-    async fn process_single_file(&self, path: String, pb: ProgressBar) -> Result<()> {
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg}")
-                .expect("Valid template"),
-        );
-
-        pb.set_message(format!("Downloading {}", path));
-
-        let temp_path = self
-            .work_dir
-            .join(format!("temp_{}.parquet", path.replace('/', "_")));
-
-        let response = self
-            .client
-            .get(&format!("https://data.commoncrawl.org/{}", path))
-            .send()
-            .await
-            .context("Failed to download file")?;
-
-        let bytes = response
-            .bytes()
-            .await
-            .context("Failed to read response bytes")?;
-
-        tokio::fs::write(&temp_path, bytes)
-            .await
-            .context("Failed to write temporary file")?;
-
-        pb.set_message(format!("Processing {}", path));
-
-        let file = tokio::fs::File::open(&temp_path).await?;
+    async fn process_downloaded_file(
+        &self,
+        temp_path: &PathBuf,
+        batch_writer: &Arc<Mutex<BatchWriter>>,
+        pb: &ProgressBar,
+    ) -> Result<()> {
+        let file = tokio::fs::File::open(temp_path).await?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(file.into_std().await)?.build()?;
 
         let mut batch_count = 0;
+        let mut total_rows = 0;
         for batch_result in reader {
-            let record_batch = batch_result?;
+            let batch = batch_result?;
+            self.process_record_batch(batch, batch_writer, &mut batch_count, &mut total_rows, pb)
+                .await?;
+        }
 
-            if let (Some(domains), Some(tlds)) = (
-                record_batch
-                    .column_by_name("url_host_registered_domain")
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
-                record_batch
-                    .column_by_name("url_host_private_suffix")
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
-            ) {
-                for (domain, tld) in domains.iter().zip(tlds.iter()) {
-                    if let (Some(domain), Some(tld)) = (domain, tld) {
-                        if !domain.is_empty() && !tld.is_empty() {
-                            let mut writer = self.batch_writer.lock().await;
-                            writer
-                                .add_domain(DomainInfo {
-                                    domain: domain.to_string(),
-                                    tld: tld.to_string(),
-                                })
-                                .await?;
-                        }
+        Ok(())
+    }
+
+    async fn process_record_batch(
+        &self,
+        batch: RecordBatch,
+        batch_writer: &Arc<Mutex<BatchWriter>>,
+        batch_count: &mut usize,
+        total_rows: &mut usize,
+        pb: &ProgressBar,
+    ) -> Result<()> {
+        if let (Some(domains), Some(tlds)) = (
+            batch
+                .column_by_name("url_host_registered_domain")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
+            batch
+                .column_by_name("url_host_private_suffix")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
+        ) {
+            let domains: Vec<_> = domains
+                .iter()
+                .zip(tlds.iter())
+                .filter_map(|(domain, tld)| match (domain, tld) {
+                    (Some(domain), Some(tld)) if !domain.is_empty() && !tld.is_empty() => {
+                        Some(DomainInfo {
+                            domain: domain.to_string(),
+                            tld: tld.to_string(),
+                        })
                     }
-                }
-            }
+                    _ => None,
+                })
+                .collect();
 
-            batch_count += 1;
-            let writer = self.batch_writer.lock().await;
+            batch_writer.lock().await.add_domains(&domains).await?;
+
+            *batch_count += 1;
+            *total_rows += batch.num_rows();
             pb.set_message(format!(
-                "Processing {} - {} record batches, {} domains in {} batches",
-                path, batch_count, writer.total_domains, writer.current_batch
+                "Processed {} rows in {} batches - {} domains written",
+                total_rows,
+                batch_count,
+                batch_writer.lock().await.total_domains
             ));
         }
 
-        tokio::fs::remove_file(temp_path).await?;
-        pb.finish_and_clear();
         Ok(())
     }
 
@@ -262,44 +295,48 @@ impl ParquetProcessor {
             Field::new("tld", DataType::Utf8, false),
         ]);
 
+        let output_file = tokio::fs::File::create("unique_domains.parquet").await?;
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .set_max_row_group_size(1024 * 1024)
             .build();
 
-        let output_file = tokio::fs::File::create("unique_domains.parquet").await?;
         let mut writer = AsyncArrowWriter::try_new(output_file, Arc::new(schema), Some(props))?;
 
         let batch_dir = self.work_dir.join("batches");
-        let mut entries = tokio::fs::read_dir(&batch_dir).await?;
+        let mut entries = Vec::new();
+        let mut dir = tokio::fs::read_dir(&batch_dir).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            entries.push(entry);
+        }
 
-        let progress = ProgressBar::new_spinner();
+        entries.par_sort_by_key(|entry| entry.path());
+
+        let progress = ProgressBar::new(entries.len() as u64);
         progress.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} Merging batch {msg}")
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} Merging batches [{wide_bar:.cyan/blue}] {pos}/{len}")
                 .expect("Valid template"),
         );
 
-        let mut merged_count = 0;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
-                merged_count += 1;
-                progress.set_message(format!("{}", merged_count));
+        for chunk in entries.chunks(5) {
+            for entry in chunk {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+                    let file = tokio::fs::File::open(&path).await?;
+                    let reader =
+                        ParquetRecordBatchReaderBuilder::try_new(file.into_std().await)?.build()?;
 
-                let file = tokio::fs::File::open(&path).await?;
-                let reader =
-                    ParquetRecordBatchReaderBuilder::try_new(file.into_std().await)?.build()?;
-
-                for batch_result in reader {
-                    writer.write(&batch_result?).await?;
+                    for batch_result in reader {
+                        writer.write(&batch_result?).await?;
+                    }
                 }
             }
+            progress.inc(chunk.len() as u64);
         }
 
         writer.close().await?;
-        progress.finish_with_message(format!("Merged {} batch files", merged_count));
-        println!("Final parquet file created successfully!");
+        progress.finish_with_message("Merge complete");
         Ok(())
     }
 }
@@ -330,11 +367,15 @@ async fn get_parquet_paths(crawl_id: &str) -> Result<Vec<String>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_cpus::get())
+        .build_global()
+        .unwrap();
+
     let crawl_id = "CC-MAIN-2024-46";
     let paths = get_parquet_paths(crawl_id).await?;
     println!("Found {} parquet files", paths.len());
 
-    // Create a work directory in the current directory
     let work_dir = PathBuf::from("crawl_data");
     let processor = ParquetProcessor::new(work_dir).await?;
     processor.process_parquet_files(paths).await?;

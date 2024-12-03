@@ -7,11 +7,16 @@ edition = "2021"
 anyhow = "1.0.93"
 arrow = "53.3.0"
 async-compression = { version = "0.4.18", features = ["tokio", "gzip"] }
+atomic = "0.6.0"
+bb8 = "0.8.6"
 bytes = "1.9.0"
 chrono = "0.4.38"
+console-subscriber = "0.4.1"
+dashmap = "6.1.0"
 flate2 = "1.0.35"
 futures = "0.3.31"
 indicatif = "0.17.9"
+memmap = "0.7.0"
 num_cpus = "1.16.0"
 parquet = { version = "53.3.0", features = ["arrow", "async"] }
 pin-project = "1.1.7"
@@ -20,6 +25,6 @@ reqwest = { version = "0.12.9", features = ["json", "stream"] }
 serde = { version = "1.0.215", features = ["derive"] }
 tempfile = "3.14.0"
 tokio = { version = "1.41.1", features = ["full"] }
-tokio-util = { version = "0.7.12", features = ["io"] }
+tokio-util = { version = "0.7.12", features = ["io", "tracing"] }
 url = "2.5.4"
 warc = "0.4.0"
